@@ -3,6 +3,7 @@ import numpy as np
 import os
 from sklearn.model_selection import train_test_split
 import h5py
+import math
 
 
 from common import common_configuration as com_cfg
@@ -19,7 +20,7 @@ def remove_empty_cubes(label_cubes, map_cubes):
             empty_cubes.append(cube_i)
     map_cubes = np.delete(map_cubes, empty_cubes, 0)
     label_cubes = np.delete(label_cubes, empty_cubes, 0)
-    return label_cubes, map_cubes
+    return label_cubes, map_cubes, empty_cubes
 
 
 def cubify(arr, newshape):
@@ -98,6 +99,80 @@ def bin_label(target, bounds, bounding_scheme):
     target[:] = np.digitize(target, bounds, right=bounding_scheme) - 1
     return target
 
+def isPowerOf2(input):
+   return input != 0 and (input & (input - 1) == 0)
+
+def pad2(label, map):
+    if label.shape != map.shape:
+        raise ValueError("invalid shape")
+    
+    # get max size among all dimension in tuple np.shape(masked_map)
+    old_shape = max(np.shape(map))
+    new_shape = old_shape
+
+    # check if size is a power of 2
+    # if not proceed with padding
+    if (not isPowerOf2(old_shape)):
+        exponent = math.ceil(math.log(old_shape, 2))
+        new_shape = int(math.pow(2, exponent))
+
+        # create temp with new size, all elements = 0
+        # copy all elements from target to temp
+        # assign temp to target
+        temp_map = np.zeros((new_shape, new_shape, new_shape))
+        temp_label = np.zeros((new_shape, new_shape, new_shape))
+        
+        temp_map[:old_shape, :old_shape, :old_shape] = map
+        temp_label[:old_shape, :old_shape, :old_shape] = label
+        map = temp_map
+        label = temp_label  
+    return label, map
+
+def uncubify(arr, oldshape):
+    N, newshape = arr.shape[0], arr.shape[1:]
+    oldshape = np.array(oldshape)    
+    repeats = (oldshape / newshape).astype(int)
+    tmpshape = np.concatenate([repeats, newshape])
+    order = np.arange(len(tmpshape)).reshape(2, -1).ravel(order='F')
+    return arr.reshape(tmpshape).transpose(order).reshape(oldshape)
+
+def rebuild(target, empty_cubes, num_16x16x16_cubes, postpad_shape, orig_shape):
+    #1 Create 4D tensor that has post-pad, post-cubify shape
+    rebuild_target = np.zeros((num_16x16x16_cubes, 16, 16, 16))
+
+    # start and end indices of non-empty cubes
+    start = 0
+    end = 0
+    
+    # keep track of count of non-empty cubes in target
+    count = 0
+    
+    # Start filling rebuild_target with non-empty cubes
+    for empty_cube in empty_cubes:
+        end = empty_cube
+        for i in range (start, end):
+            rebuild_target[i] = target[count]
+            count += 1
+        start = end + 1
+
+    # Uncubify: Convert 4D tensor to 3D tensor with post-padding shape 
+    # all dimensions is highest of power of 2 of original shape
+    rebuild_target = uncubify(rebuild_target, postpad_shape)
+
+    # Get original shape of each dimension
+    # Slice/shed 3D tensor to match original shape
+    dim1 = orig_shape[0]
+    dim2 = orig_shape[1]
+    dim3 = orig_shape[2]
+    rebuild_target = rebuild_target[:dim1, :dim2, :dim3]
+    
+    return rebuild_target
+
+def check_rebuild_result(post_process, orig):
+    if np.array_equal(post_process, orig):
+        print("          Rebuild is successful!")
+    else:
+        print("          Rebuild failed!")
 
 def process_data(emdb_path_dict, train_repo_path, test_repo_path, validation_repo_path, bin_boundaries, bin_scheme):
     # Process maps and labels into their respespective repositories for 
@@ -134,8 +209,16 @@ def process_data(emdb_path_dict, train_repo_path, test_repo_path, validation_rep
         print("     mask_elements(map, ...)...")
         map = mask_elements(map, mask)
         
+        # Save original masked map and label for later comparison with rebuild
+        # map and mask to check that rebuild() works correctly
+        orig_masked_label = label
+        orig_masked_map = map
+      
         print("     pad(label, map, ...)...")
-        label, map = pad(label, map)
+
+        # Change padding technique from pad to pad2
+        #label, map = pad(label, map)
+        label, map = pad2(label, map)
         
         print("     cubify(label, ...)...")
         label_cubes = cubify(label, com_cfg.MODEL_INPUT_SHAPE)
@@ -149,8 +232,25 @@ def process_data(emdb_path_dict, train_repo_path, test_repo_path, validation_rep
         # methodology for storing cube location information in the repository
         # for later reconstruction
         print("     remove_empty_cubes(label_cubes, map_cubes)...")
-        label_cubes, map_cubes = remove_empty_cubes(label_cubes, map_cubes)
+        label_cubes, map_cubes, empty_cubes = remove_empty_cubes(label_cubes, map_cubes)
 
+        # Get num_cubes, postpad_shape and orig_shape for rebuild() function
+        num_cubes = int(np.shape(label)[0]**3 / (16**3))
+        postpad_shape = np.shape(label)
+        orig_shape = np.shape(orig_masked_map)
+        
+        print("     rebuild label...")
+        rebuild_label = rebuild(label_cubes, empty_cubes, num_cubes, postpad_shape, orig_shape)
+        
+        print("     check_rebuild_result(post_process, orig)...")
+        check_rebuild_result(rebuild_label, orig_masked_label)
+        
+        print("     rebuild map...")
+        rebuild_map = rebuild(map_cubes, empty_cubes, num_cubes, postpad_shape, orig_shape)
+        
+        print("     check_rebuild_result(post_process, orig)...")
+        check_rebuild_result(rebuild_map, orig_masked_map)
+        
         non_zero_cube_count += label_cubes.shape[0]
 
         print("     train_test_split(label_cubes, map_cubes...)...")
